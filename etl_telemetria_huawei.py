@@ -7,16 +7,19 @@ caminho_padrao = Path(
     r"C:\Users\batat\Downloads\Python\POS\Regressão Linear\dados_corrida\analise_corridas\new\Análise de desempenho em corridas\Motion path detail data & description"
 )
 
+# Treinos gravados errado (ex.: bike no modo corrida) removidos dos 3 CSVs
+IDS_EXCLUIR = [
+    "vrh+DwAAAAACAAAA6DwriZgBAAA=",  # 2025-08-08 - cadência 7 / 104 bpm
+    "bFAkEgAAAAACAAAAfhfQdp0BAAA=",  # 2026-04-10 - bike manhã / cadência 25
+]
+
+# Opcional: adicione aqui pesagens posteriores a 2026-07-10 se o peso mudou
+PESO_MANUAL = [
+    # ("2026-09-15", 78.5),
+]
+
 
 def localizar_treinos():
-  if (
-      "todos_treinos" in globals()
-      and isinstance(todos_treinos, list)
-      and len(todos_treinos) > 0
-  ):
-    print(f"Reaproveitando {len(todos_treinos)} sessões já carregadas na memória.")
-    return todos_treinos
-
   pasta_alvo = caminho_padrao if caminho_padrao.exists() else None
   if pasta_alvo is None:
     for base in [Path.cwd(), Path.cwd().parent, Path.cwd().parent.parent]:
@@ -29,6 +32,14 @@ def localizar_treinos():
 
   if pasta_alvo is None:
     pasta_alvo = Path.cwd()
+
+  if (
+      "todos_treinos" in globals()
+      and isinstance(todos_treinos, list)
+      and len(todos_treinos) > 0
+  ):
+    print(f"Reaproveitando {len(todos_treinos)} sessões já carregadas na memória.")
+    return todos_treinos, pasta_alvo
 
   treinos = []
   for arq in pasta_alvo.rglob("*.json"):
@@ -45,7 +56,62 @@ def localizar_treinos():
       continue
 
   print(f"Lidas {len(treinos)} sessões de: {pasta_alvo}")
-  return treinos
+  return treinos, pasta_alvo
+
+
+def extrair_historico_peso(pasta_raiz):
+  """Lê pesagens dos JSONs do export da Huawei e combina com PESO_MANUAL."""
+  registros = []
+
+  if pasta_raiz.exists():
+    for arq in pasta_raiz.rglob("*.json"):
+      if "Motion path" in str(arq) or ".ipynb_checkpoints" in str(arq):
+        continue
+      try:
+        texto = arq.read_text(encoding="utf-8", errors="ignore")
+        if "bodyWeight" not in texto and "weight" not in texto.lower():
+          continue
+        dados = json.loads(texto)
+        itens = dados if isinstance(dados, list) else [dados]
+        for item in itens:
+          if not isinstance(item, dict):
+            continue
+          for pt in item.get("samplePoints", []):
+            val_raw = pt.get("value", "")
+            val = (
+                json.loads(val_raw)
+                if isinstance(val_raw, str) and val_raw.startswith("{")
+                else val_raw
+            )
+            if isinstance(val, dict) and "bodyWeight" in val:
+              ts = pt.get("startTime") or item.get("startTime")
+              peso = float(val["bodyWeight"])
+              if ts and 30 <= peso <= 200:
+                registros.append((
+                    (
+                        pd.to_datetime(int(ts), unit="ms")
+                        - pd.Timedelta(hours=3)
+                    ).floor("s"),
+                    round(peso, 2),
+                ))
+      except Exception:
+        continue
+
+  for data_str, peso_val in PESO_MANUAL:
+    registros.append((pd.to_datetime(data_str), round(float(peso_val), 2)))
+
+  if not registros:
+    print("Nenhuma pesagem encontrada nos JSONs ou em PESO_MANUAL.")
+    return pd.DataFrame(columns=["data_peso", "peso_kg"])
+
+  df_peso = (
+      pd.DataFrame(registros, columns=["data_peso", "peso_kg"])
+      .sort_values("data_peso")
+      .drop_duplicates("data_peso", keep="last")
+      .reset_index(drop=True)
+  )
+  print(f"Pesagens carregadas: {len(df_peso)} registros.")
+  return df_peso
 
 
 def formatar_pace(pace_dec):
@@ -220,6 +286,10 @@ def construir_janelas_km(
 
 
 def processar_tudo(treino):
+  rec_id = treino.get("recordId")
+  if rec_id in IDS_EXCLUIR:
+    return None, None, None
+
   s_raw = treino.get("summaryData", "{}")
   s = json.loads(s_raw) if isinstance(s_raw, str) else (s_raw or {})
   sport_type = s.get("sportType")
@@ -245,8 +315,11 @@ def processar_tudo(treino):
   if not janelas:
     return None, None, None
 
-  rec_id = treino.get("recordId")
-  data_treino = pd.to_datetime(start_ms, unit="ms") - pd.Timedelta(hours=3)
+  # Padroniza timestamp sem milissegundos para evitar erro de leitura nos CSVs
+  data_treino = (
+      pd.to_datetime(start_ms, unit="ms") - pd.Timedelta(hours=3)
+  ).floor("s")
+
   modalidade = "Rua" if sport_type == 258 else "Esteira"
   dist_km = total_dist_m / 1000.0
   duracao_min = total_time_s / 60.0
@@ -349,7 +422,7 @@ def processar_tudo(treino):
   if not kms_cheios.empty and (kms_cheios["pace_dec"] < 2.75).any():
     return None, None, None
 
-  # --- 2. DF POR 100M (ancorado nas mesmas janelas oficiais) ---
+  # --- 2. DF POR 100M ---
   splits_100m = []
   if len(rs_rows) >= 10:
     df_vel = pd.DataFrame(rs_rows, columns=["k_raw", "vel_ms"])
@@ -588,8 +661,8 @@ def processar_tudo(treino):
   return resumo_treino, df_km_sessao, df_100m_sessao
 
 
-# Executa o pipeline completo e salva os 3 CSVs sincronizados
-todos_treinos = localizar_treinos()
+# === EXECUÇÃO DO PIPELINE ===
+todos_treinos, pasta_motion = localizar_treinos()
 resumos, lista_km, lista_100m = [], [], []
 
 for t in todos_treinos:
@@ -612,7 +685,80 @@ df_por_100m = (
     .reset_index(drop=True)
 )
 
-# Adiciona defasagens de inclinação (100m e 200m antes) para inércia cardíaca
+# --- Enriquecimento temporal ---
+df_corridas["ano"] = df_corridas["data"].dt.year
+df_corridas["mes"] = df_corridas["data"].dt.strftime("%Y-%m")
+df_corridas["dia_semana"] = df_corridas["data"].dt.day_name()
+df_corridas["hora"] = df_corridas["data"].dt.hour
+df_corridas["horario"] = df_corridas["data"].dt.strftime("%H:%M")
+df_corridas["periodo_dia"] = pd.cut(
+    df_corridas["hora"],
+    bins=[-1, 4, 11, 17, 23],
+    labels=["Madrugada", "Manhã", "Tarde", "Noite"],
+)
+
+# --- Faixas de distância ---
+ordem_faixas = [
+    "< 2K",
+    "Curto (2-4.89K)",
+    "Base 5K",
+    "5-6K",
+    "Base 6K",
+    "6-7K",
+    "Base 7K",
+    "7-8K",
+    "Base 8K",
+    "8-10K",
+    "Base 10K",
+    "+10K",
+]
+df_corridas["faixa_distancia"] = pd.cut(
+    df_corridas["distancia_km"],
+    bins=[0.0, 1.99, 4.89, 5.4, 5.9, 6.3, 6.9, 7.3, 7.9, 8.3, 9.8, 10.3, 50],
+    labels=ordem_faixas,
+    include_lowest=True,
+)
+df_corridas["faixa_distancia"] = pd.Categorical(
+    df_corridas["faixa_distancia"], categories=ordem_faixas, ordered=True
+)
+bases_fechadas = ["Base 5K", "Base 6K", "Base 7K", "Base 8K", "Base 10K"]
+df_corridas["distancia_fechada"] = df_corridas["faixa_distancia"].isin(
+    bases_fechadas
+)
+
+# --- Peso Corporal (interpolação linear pelo tempo, sem NaNs) ---
+df_peso = extrair_historico_peso(pasta_motion.parent)
+if not df_peso.empty:
+  ts_peso = (
+      pd.to_datetime(df_peso["data_peso"])
+      .astype("datetime64[s]")
+      .astype("int64")
+      .to_numpy()
+  )
+  vals_peso = df_peso["peso_kg"].to_numpy()
+  ts_corridas = (
+      pd.to_datetime(df_corridas["data"])
+      .astype("datetime64[s]")
+      .astype("int64")
+      .to_numpy()
+  )
+  df_corridas["peso_kg"] = np.round(
+      np.interp(ts_corridas, ts_peso, vals_peso), 2
+  )
+else:
+  df_corridas["peso_kg"] = np.nan
+
+# Propaga peso_kg, faixa_distancia e distancia_fechada para 1km e 100m
+mapa_peso = df_corridas.set_index("record_id")["peso_kg"]
+mapa_faixa = df_corridas.set_index("record_id")["faixa_distancia"]
+mapa_fechada = df_corridas.set_index("record_id")["distancia_fechada"]
+
+for df_detalhe in (df_por_km, df_por_100m):
+  df_detalhe["peso_kg"] = df_detalhe["record_id"].map(mapa_peso)
+  df_detalhe["faixa_distancia"] = df_detalhe["record_id"].map(mapa_faixa)
+  df_detalhe["distancia_fechada"] = df_detalhe["record_id"].map(mapa_fechada)
+
+# Defasagens de inclinação (100m e 200m antes) para inércia cardíaca
 df_por_100m["inclinacao_lag1_pct"] = df_por_100m.groupby("record_id")[
     "inclinacao_pct"
 ].shift(1)
@@ -620,11 +766,28 @@ df_por_100m["inclinacao_lag2_pct"] = df_por_100m.groupby("record_id")[
     "inclinacao_pct"
 ].shift(2)
 
+# Auditoria rápida para flagrar futuros treinos gravados errado
+suspeitos = df_corridas[
+    (df_corridas["modalidade"] == "Rua")
+    & (
+        (df_corridas["hora"] < 12)
+        | (
+            (df_corridas["pace_dec"] < 8.0)
+            & (df_corridas["cadencia_media"].fillna(0) < 140)
+        )
+    )
+][["record_id", "data", "distancia_km", "pace_fmt", "bpm_medio", "cadencia_media"]]
+
+if not suspeitos.empty:
+  print("\n=== TREINOS SUSPEITOS ===")
+  print(suspeitos.to_string(index=False))
+
+# Salva os 3 CSVs consolidados
 df_corridas.to_csv("df_corridas.csv", index=False)
 df_por_km.to_csv("df_por_km.csv", index=False)
 df_por_100m.to_csv("df_por_100m.csv", index=False)
 
 print("\nBases consolidadas e salvas:")
-print(f" - df_corridas.csv : {df_corridas.shape}")
+print(f" - df_corridas.csv : {df_corridas.shape} | peso preenchido: {df_corridas['peso_kg'].notna().sum()}/{len(df_corridas)}")
 print(f" - df_por_km.csv   : {df_por_km.shape}")
 print(f" - df_por_100m.csv : {df_por_100m.shape}")
